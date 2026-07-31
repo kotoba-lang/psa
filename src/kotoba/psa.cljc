@@ -263,3 +263,208 @@
 
 (defn hours->ms [h] (* h ms-per-hour))
 (defn ms->hours [ms] (/ (double ms) ms-per-hour))
+
+;; ---------------------------------------------------------------------------
+;; Currency
+;;
+;; A fourth invariant, and the same shape as the other three: an amount
+;; whose rate to the target currency is unknown is NOT converted at 1:1,
+;; not dropped, and not silently summed with amounts in another currency.
+;; It is reported. Every conversion carries the rate and the date it was
+;; taken from, because an invoice total that cannot say which rate it used
+;; is an invoice total nobody can check.
+;; ---------------------------------------------------------------------------
+
+(defn fx-rate
+  "One directed rate: `n` units of `to` per unit of `from`, `as-of` a date
+  string. Rates are directional and are NOT inverted automatically — a
+  buy rate is not a sell rate, and inferring one from the other would
+  invent a spread."
+  [from to rate as-of]
+  {:fx/from from :fx/to to :fx/rate rate :fx/as-of as-of})
+
+(defn convert
+  "Convert `amount` from `from` to `to` using `rates`.
+
+  Returns `{:money/amount n :money/currency to :money/rate r :money/as-of d}`,
+  or `{:money/unconvertible? true :money/currency from}` when no rate is
+  declared. Same currency converts at 1 with no rate lookup."
+  [rates amount from to]
+  (if (= from to)
+    {:money/amount amount :money/currency to :money/rate 1 :money/as-of nil}
+    (if-let [r (first (filter #(and (= from (:fx/from %)) (= to (:fx/to %))) rates))]
+      {:money/amount (* amount (:fx/rate r))
+       :money/currency to :money/rate (:fx/rate r) :money/as-of (:fx/as-of r)}
+      {:money/unconvertible? true :money/currency from :money/amount amount})))
+
+(defn total-in
+  "Sum `{:amount :currency}` items into `currency`.
+
+  `:total/unconvertible` lists what could not be converted, and those
+  amounts are NOT in `:total/amount`. A total that quietly absorbed a
+  currency it could not price would be wrong by an unknown factor; one
+  that silently dropped it would be wrong by a known one. Neither is
+  reported as complete: `:total/complete?` says which you have."
+  [rates items currency]
+  (let [converted (map #(assoc (convert rates (:amount %) (:currency %) currency) :item %) items)
+        {bad true good false} (group-by #(boolean (:money/unconvertible? %)) converted)]
+    {:total/amount        (reduce + 0 (map :money/amount good))
+     :total/currency      currency
+     ;; Only rates an actual lookup produced. A same-currency item
+     ;; converts at 1 without consulting anything, and listing that as a
+     ;; "rate used" would pad the audit trail with a fact nobody supplied.
+     :total/rates-used    (vec (distinct (keep #(when (:money/as-of %)
+                                                  (select-keys % [:money/rate :money/as-of]))
+                                               good)))
+     :total/unconvertible (mapv :item bad)
+     :total/complete?     (empty? bad)}))
+
+;; ---------------------------------------------------------------------------
+;; Expenses
+;; ---------------------------------------------------------------------------
+
+(defn expense
+  "A cost incurred on a project. `:billable?` decides whether it reaches
+  an invoice; `:markup` (e.g. 0.1 for 10%) is applied only to billable
+  expenses and defaults to none.
+
+  A non-billable expense still counts against margin. Absorbing a cost is
+  a decision about who pays, not a reason to stop counting it."
+  [id project amount currency & {:keys [billable? markup category date incurred-by]}]
+  {:expense/id          id
+   :expense/project     project
+   :expense/amount      amount
+   :expense/currency    currency
+   :expense/billable?   (boolean billable?)
+   :expense/markup      (or markup 0)
+   :expense/category    category
+   :expense/date        date
+   :expense/incurred-by incurred-by})
+
+(defn expense-billable-amount
+  "What a billable expense adds to an invoice: cost plus markup. Zero for
+  a non-billable one."
+  [e]
+  (if (:expense/billable? e)
+    (* (:expense/amount e) (+ 1 (:expense/markup e)))
+    0))
+
+;; ---------------------------------------------------------------------------
+;; Subcontractors
+;; ---------------------------------------------------------------------------
+
+(defn subcontract
+  "A subcontractor's hours on a project: what they are paid (`cost-rate`)
+  and what the client is billed (`bill-rate`).
+
+  Both rates are explicit rather than derived from the project's rate
+  card, because a subcontractor's cost is a separate negotiation and
+  inheriting the internal cost rate would report someone else's payroll
+  as this firm's."
+  [id project vendor role hours cost-rate bill-rate currency]
+  {:sub/id id :sub/project project :sub/vendor vendor :sub/role role
+   :sub/hours hours :sub/cost-rate cost-rate :sub/bill-rate bill-rate
+   :sub/currency currency})
+
+(defn subcontract-margin [s]
+  {:sub/billable (* (:sub/hours s) (:sub/bill-rate s))
+   :sub/cost     (* (:sub/hours s) (:sub/cost-rate s))
+   :sub/amount   (* (:sub/hours s) (- (:sub/bill-rate s) (:sub/cost-rate s)))})
+
+(defn project-margin
+  "Margin across everything a project actually costs: labour, billable and
+  non-billable expenses, and subcontractors.
+
+  Inherits invariant 2 unchanged — one uncosted labour entry and the
+  whole figure is `:unknown`. Expenses and subcontractors always carry
+  both sides, so they cannot be the reason it is unknown, but they are
+  reported separately so a reader can see WHERE the money went rather
+  than only how much is left."
+  [priced expenses subs]
+  (let [labour (margin priced)
+        exp-billable (reduce + 0 (map expense-billable-amount expenses))
+        exp-cost (reduce + 0 (map :expense/amount expenses))
+        sub-m (map subcontract-margin subs)
+        sub-billable (reduce + 0 (map :sub/billable sub-m))
+        sub-cost (reduce + 0 (map :sub/cost sub-m))
+        revenue (+ (:margin/revenue labour) exp-billable sub-billable)
+        known? (not= :unknown (:margin/cost labour))
+        cost (when known? (+ (:margin/cost labour) exp-cost sub-cost))]
+    {:margin/revenue          revenue
+     :margin/cost             (if known? cost :unknown)
+     :margin/amount           (if known? (- revenue cost) :unknown)
+     :margin/ratio            (if (and known? (pos? revenue))
+                                (double (/ (- revenue cost) revenue))
+                                :unknown)
+     :margin/labour           labour
+     :margin/expense-revenue  exp-billable
+     :margin/expense-cost     exp-cost
+     :margin/subcontract-revenue sub-billable
+     :margin/subcontract-cost    sub-cost
+     :margin/unpriced-count   (:margin/unpriced-count labour)
+     :margin/uncosted-count   (:margin/uncosted-count labour)}))
+
+;; ---------------------------------------------------------------------------
+;; Revenue recognition
+;; ---------------------------------------------------------------------------
+
+(def recognition-methods
+  "How revenue is recognised over a project's life.
+
+    :as-delivered      recognise what has been delivered — time-and-
+                       materials, where each hour is its own performance
+                       obligation
+    :percent-complete  recognise a fixed fee in proportion to progress
+    :on-completion     recognise nothing until the project is complete"
+  #{:as-delivered :percent-complete :on-completion})
+
+(defn contract
+  "A revenue contract for a project. `:fee` is the fixed fee for
+  `:percent-complete` / `:on-completion`; it is ignored (and may be nil)
+  for `:as-delivered`. `:budget-hours` is the denominator for progress
+  and is required for `:percent-complete`."
+  [project method & {:keys [fee currency budget-hours]}]
+  (when (contains? recognition-methods method)
+    {:contract/project      project
+     :contract/method       method
+     :contract/fee          fee
+     :contract/currency     (or currency "USD")
+     :contract/budget-hours budget-hours}))
+
+(defn recognize
+  "Revenue recognised so far under `contract-record`.
+
+  Returns `{:revenue/amount n :revenue/method m :revenue/progress p}`, or
+  `:unknown` for `:amount` when the inputs the method needs are absent —
+  percent-complete with no budget cannot produce a percentage, and a
+  project 'about 80% done' is an estimate, not a measurement. This
+  refuses to supply the estimate.
+
+  Progress is capped at 1.0: an over-budget project has delivered its
+  scope, not 130% of the contract's value. The overrun shows up in
+  margin, which is where it belongs."
+  [contract-record priced complete?]
+  (let [{:contract/keys [method fee budget-hours]} contract-record
+        delivered (reduce + 0 (map (comp :ts/hours :priced/entry) priced))]
+    (case method
+      :as-delivered
+      {:revenue/method method
+       :revenue/amount (reduce + 0 (keep :priced/billable priced))
+       :revenue/progress nil
+       :revenue/unpriced-count (count (filter :priced/unpriced? priced))}
+
+      :percent-complete
+      (if (and budget-hours (pos? budget-hours) fee)
+        (let [p (min 1.0 (/ (double delivered) budget-hours))]
+          {:revenue/method method :revenue/amount (* fee p) :revenue/progress p
+           :revenue/delivered-hours delivered :revenue/budget-hours budget-hours})
+        {:revenue/method method :revenue/amount :unknown :revenue/progress :unknown
+         :revenue/reason (if fee :no-budget-hours :no-fee)})
+
+      :on-completion
+      {:revenue/method method
+       :revenue/amount (if complete? fee 0)
+       :revenue/progress (if complete? 1.0 0.0)
+       :revenue/complete? (boolean complete?)}
+
+      {:revenue/method method :revenue/amount :unknown :revenue/reason :unknown-method})))

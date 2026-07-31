@@ -22,11 +22,11 @@ any of them depending on the others.
 |---|---|
 | Role | capability |
 | Dependencies | none |
-| Tests | 25 tests, 56 assertions, all green |
+| Tests | 41 tests, 96 assertions, all green |
 | Runtime | `.cljc`, JVM + ClojureScript |
 | Actor | `cloud-itonami/tehai` (手配) |
 
-## The three invariants
+## The four invariants
 
 Each has a test that fails if it stops holding. Every one is a place where PSA
 tools conventionally produce a confident number instead of admitting a gap.
@@ -54,6 +54,10 @@ the whole figure, and the count travels with it.
 **3. Utilization needs a denominator.** With no declared capacity, utilization is
 `:unknown`, not 1.0. A utilization figure is the number people are managed by,
 so its denominator does not get invented.
+
+**4. No rate, no conversion.** An amount whose FX rate to the target currency is
+unknown is not converted at 1:1 and not dropped — it is excluded from the total
+and named, and the total says it is incomplete. See below.
 
 ## Contract
 
@@ -108,6 +112,58 @@ and a re-imported timesheet cannot be billed twice.
 `describe-gap` returns the empty string when nothing was excluded, so a caller
 can append it unconditionally without printing a reassuring "no problems" line
 that is really "nothing was checked".
+
+## Expenses, subcontractors, revenue and currency
+
+```clojure
+;; Expenses. A non-billable expense still counts against margin —
+;; absorbing a cost decides who pays, not whether to count it.
+(psa/expense "e-1" "alpha" 10000 "USD" :billable? true :markup 0.1)
+(psa/expense-billable-amount e)          ;; 11000.0; 0 when non-billable
+
+;; Subcontractors carry BOTH rates explicitly, because a subcontractor's
+;; cost is a separate negotiation — inheriting the internal cost rate
+;; would report someone else's payroll as this firm's.
+(psa/subcontract "s-1" "alpha" "vendor-a" :engineer 10 8000 14000 "USD")
+
+;; Margin across everything a project costs. Invariant 2 is unchanged:
+;; one uncosted labour entry and the whole figure is :unknown.
+(psa/project-margin priced expenses subs)
+;; => {:margin/revenue .. :margin/amount .. :margin/expense-revenue ..
+;;     :margin/subcontract-cost ..}
+```
+
+**Revenue recognition** — `:as-delivered`, `:percent-complete`, `:on-completion`:
+
+```clojure
+(psa/contract "alpha" :percent-complete :fee 1000000 :budget-hours 100)
+(psa/recognize contract priced complete?)
+;; => {:revenue/amount 400000.0 :revenue/progress 0.4}
+```
+
+Percent-complete with no budget returns `:unknown`, not an estimate — "about 80%
+done" is a guess and this refuses to supply it. Progress caps at 1.0: an
+over-budget project delivered its scope, not 130% of the contract's value, and
+the overrun shows up in margin where it belongs.
+
+**A fourth invariant — no rate, no conversion:**
+
+```clojure
+(psa/fx-rate "EUR" "USD" 1.08 "2026-01-01")
+(psa/convert rates 1000 "EUR" "USD")
+;; => {:money/amount 1080.0 :money/rate 1.08 :money/as-of "2026-01-01"}
+
+(psa/total-in rates items "USD")
+;; => {:total/amount .. :total/rates-used [..]
+;;     :total/unconvertible [..] :total/complete? false}
+```
+
+An amount whose rate is unknown is not converted at 1:1 and not dropped: it is
+excluded from the total and named, and `:total/complete?` says which you have.
+Rates are directional and are **not** inverted automatically — a buy rate is not
+a sell rate, and inferring one would invent a spread. Every conversion carries
+the rate and the date it came from, because a total that cannot say which rate
+it used is a total nobody can check.
 
 ## Composing
 

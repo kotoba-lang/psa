@@ -218,3 +218,152 @@
 
 (deftest hours-and-ms-round-trip
   (is (= 1.5 (psa/ms->hours (psa/hours->ms 1.5)))))
+
+;; ---------------------------------------------------------------------------
+;; Invariant 4 — no rate, no conversion
+;; ---------------------------------------------------------------------------
+
+(def ^:private rates
+  [(psa/fx-rate "EUR" "USD" 1.08 "2026-01-01")
+   (psa/fx-rate "JPY" "USD" 0.0064 "2026-01-01")])
+
+(deftest same-currency-converts-at-one-without-a-rate-lookup
+  (let [m (psa/convert [] 1000 "USD" "USD")]
+    (is (= 1000 (:money/amount m)))
+    (is (= 1 (:money/rate m)))))
+
+(deftest a-conversion-carries-the-rate-and-the-date-it-came-from
+  (let [m (psa/convert rates 1000 "EUR" "USD")]
+    (is (= 1080.0 (:money/amount m)))
+    (is (= 1.08 (:money/rate m)))
+    (testing "an invoice total that cannot say which rate it used is uncheckable"
+      (is (= "2026-01-01" (:money/as-of m))))))
+
+(deftest rates-are-directional-and-not-inverted-automatically
+  (testing "a buy rate is not a sell rate; inferring one invents a spread"
+    (is (:money/unconvertible? (psa/convert rates 1000 "USD" "EUR")))))
+
+(deftest an-unpriced-currency-is-neither-converted-at-one-nor-dropped
+  (let [t (psa/total-in rates [{:amount 1000 :currency "USD"}
+                               {:amount 1000 :currency "EUR"}
+                               {:amount 1000 :currency "GBP"}]
+                        "USD")]
+    (is (= 2080.0 (:total/amount t)))
+    (testing "the GBP amount is absent from the total AND named"
+      (is (= 1 (count (:total/unconvertible t))))
+      (is (= "GBP" (:currency (first (:total/unconvertible t))))))
+    (testing "and the total says it is incomplete rather than looking finished"
+      (is (not (:total/complete? t))))))
+
+(deftest a-fully-convertible-total-says-so-and-lists-its-rates
+  (let [t (psa/total-in rates [{:amount 1000 :currency "USD"}
+                               {:amount 1000 :currency "EUR"}]
+                        "USD")]
+    (is (:total/complete? t))
+    (is (= 1 (count (:total/rates-used t))))))
+
+;; ---------------------------------------------------------------------------
+;; Expenses
+;; ---------------------------------------------------------------------------
+
+(deftest a-billable-expense-carries-its-markup
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? true :markup 0.1)]
+    (is (= 11000.0 (psa/expense-billable-amount e)))))
+
+(deftest a-non-billable-expense-bills-nothing-but-still-costs
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? false)
+        m (psa/project-margin [] [e] [])]
+    (is (zero? (psa/expense-billable-amount e)))
+    (testing "absorbing a cost decides who pays, not whether to count it"
+      (is (= 10000 (:margin/expense-cost m))))))
+
+(deftest markup-applies-only-to-billable-expenses
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? false :markup 0.5)]
+    (is (zero? (psa/expense-billable-amount e)))))
+
+;; ---------------------------------------------------------------------------
+;; Subcontractors
+;; ---------------------------------------------------------------------------
+
+(deftest a-subcontractor-carries-both-rates-explicitly
+  (let [s (psa/subcontract "s-1" "alpha" "vendor-a" :engineer 10 8000 14000 "USD")
+        m (psa/subcontract-margin s)]
+    (is (= 140000 (:sub/billable m)))
+    (is (= 80000 (:sub/cost m)))
+    (is (= 60000 (:sub/amount m)))))
+
+(deftest project-margin-separates-where-the-money-went
+  (let [priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 10)])
+        expenses [(psa/expense "e-1" "alpha" 20000 "USD" :billable? true :markup 0.1)]
+        subs [(psa/subcontract "s-1" "alpha" "vendor-a" :engineer 10 8000 14000 "USD")]
+        m (psa/project-margin priced expenses subs)]
+    (is (= 312000.0 (:margin/revenue m)))     ;; 150000 labour + 22000 expense + 140000 sub
+    (is (= 190000 (:margin/cost m)))          ;;  90000 labour + 20000 expense +  80000 sub
+    (is (= 122000.0 (:margin/amount m)))
+    (testing "each source is visible, not just the net"
+      (is (= 22000.0 (:margin/expense-revenue m)))
+      (is (= 140000 (:margin/subcontract-revenue m))))))
+
+(deftest invariant-2-survives-the-extra-cost-sources
+  (testing "one uncosted labour entry still poisons the whole project margin"
+    (let [priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "beta" :engineer 10)])   ;; no cost rate
+          m (psa/project-margin priced
+                                [(psa/expense "e-1" "beta" 100 "USD" :billable? true)]
+                                [(psa/subcontract "s-1" "beta" "v" :engineer 1 1 2 "USD")])]
+      (is (= :unknown (:margin/amount m)))
+      (is (= :unknown (:margin/ratio m)))
+      (testing "and the expense and subcontract figures are still reported"
+        (is (= 100 (:margin/expense-revenue m)))))))
+
+;; ---------------------------------------------------------------------------
+;; Revenue recognition
+;; ---------------------------------------------------------------------------
+
+(deftest as-delivered-recognises-what-was-billed
+  (let [c (psa/contract "alpha" :as-delivered)
+        priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 10)])]
+    (is (= 150000 (:revenue/amount (psa/recognize c priced false))))))
+
+(deftest percent-complete-needs-a-budget-and-a-fee
+  (let [priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 40)])]
+    (testing "with both, progress is measured"
+      (let [c (psa/contract "alpha" :percent-complete :fee 1000000 :budget-hours 100)
+            r (psa/recognize c priced false)]
+        (is (= 0.4 (:revenue/progress r)))
+        (is (= 400000.0 (:revenue/amount r)))))
+    (testing "without a budget, 'about 80% done' is an estimate this refuses to supply"
+      (let [c (psa/contract "alpha" :percent-complete :fee 1000000)
+            r (psa/recognize c priced false)]
+        (is (= :unknown (:revenue/amount r)))
+        (is (= :no-budget-hours (:revenue/reason r)))))
+    (testing "without a fee either"
+      (let [c (psa/contract "alpha" :percent-complete :budget-hours 100)
+            r (psa/recognize c priced false)]
+        (is (= :unknown (:revenue/amount r)))
+        (is (= :no-fee (:revenue/reason r)))))))
+
+(deftest progress-is-capped-at-one
+  (testing "an over-budget project delivered its scope, not 130% of the contract"
+    (let [c (psa/contract "alpha" :percent-complete :fee 1000000 :budget-hours 100)
+          priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "alpha" :engineer 130)])
+          r (psa/recognize c priced false)]
+      (is (= 1.0 (:revenue/progress r)))
+      (is (= 1000000.0 (:revenue/amount r)))
+      (testing "the overrun shows up in margin, which is where it belongs —
+                130h billed against a fee that recognises only 100h of it"
+        (is (= 1950000 (:margin/revenue (psa/margin priced))))))))
+
+(deftest on-completion-recognises-nothing-until-it-is-done
+  (let [c (psa/contract "alpha" :on-completion :fee 500000)
+        priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 90)])]
+    (is (zero? (:revenue/amount (psa/recognize c priced false))))
+    (is (= 500000 (:revenue/amount (psa/recognize c priced true))))))
+
+(deftest an-unknown-recognition-method-does-not-construct
+  (is (nil? (psa/contract "alpha" :vibes-based))))
