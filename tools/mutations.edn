@@ -135,4 +135,38 @@
   :invariant "no contributing card is not the same as two disagreeing ones"
   :file "src/kotoba/psa.cljc"
   :find "mixed? (> (count currencies) 1)"
-  :replace "mixed? (not= (count currencies) 1)"}]
+  :replace "mixed? (not= (count currencies) 1)"}
+
+ ;; --- `:invoice/total` and the currencies it may have added together
+ ;; (2026-08-18). The total's wrongness on a mixed invoice is NOT fixed here
+ ;; and these mutations do not pretend it is; they measure the detector. ---
+
+ {:id :a-mixed-total-is-not-marked-single
+  :invariant "the total can no longer be read as one currency without checking"
+  :file "src/kotoba/psa.cljc"
+  :find "       (<= (count (distinct (keep :rate/currency cards-used))) 1)"
+  :replace "       true"}
+
+ {:id :the-currencies-are-not-named
+  :invariant "which currencies, not just how many — named, not counted"
+  :file "src/kotoba/psa.cljc"
+  :find "       :invoice/currencies (vec (sort (distinct (keep :rate/currency cards-used))))"
+  :replace "       :invoice/currencies []"}
+
+ {:id :one-currency-is-not-two
+  :invariant "a single-currency invoice is not reported as mixed"
+  :file "src/kotoba/psa.cljc"
+  :find "(keep :rate/currency cards-used))) 1)"
+  :replace "(keep :rate/currency cards-used))) 0)"}
+
+ {:id :offered-cards-are-not-used-cards
+  :invariant "a card that priced nothing must not make the total look mixed"
+  :file "src/kotoba/psa.cljc"
+  :find "       :invoice/total-is-one-currency?\n       (<= (count (distinct (keep :rate/currency cards-used))) 1)"
+  :replace "       :invoice/total-is-one-currency?\n       (<= (count (distinct (keep :rate/currency cards))) 1)"}
+
+ {:id :the-total-itself-is-untouched
+  :invariant "this change adds a detector and does NOT redefine the total"
+  :file "src/kotoba/psa.cljc"
+  :find "       :invoice/total    (reduce + 0 (map :line/amount lines))"
+  :replace "       :invoice/total    (reduce + 0 (map :line/hours lines))"}]
