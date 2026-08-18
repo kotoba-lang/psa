@@ -561,3 +561,66 @@
         (is (= (str "3 rate cards declared no tax category, so no per-category"
                     " subtotals were stated")
                (psa/describe-tax-gap inv)))))))
+
+;; ---------------------------------------------------------------------------
+;; `:invoice/total` and the currencies it may have added together
+;;
+;; Measured 2026-08-18 while verifying the subtotals: an invoice drawing on a
+;; ¥10,000/h card and a $100/h card reports `:invoice/total` 100500, which is
+;; ¥100,000 and $500 added together. The subtotals refuse that case; the total
+;; does not, and predates them.
+;;
+;; The total's meaning is not changed — consumers read it, and silently
+;; redefining a key is worse than a wrong number somebody can detect. What is
+;; added is the detection.
+;; ---------------------------------------------------------------------------
+
+(defn- ts* [role d h]
+  {:ts/project "p1" :ts/worker (str role "-w") :ts/role role :ts/date d :ts/hours h})
+
+(deftest a-total-that-added-unlike-things-says-so
+  (let [mixed [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+               (psa/rate-card "p1" "designer" 100 :currency "USD" :tax-category :standard)]
+        inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)
+                                   (ts* "designer" "2026-08-01" 5)] mixed)]
+    (testing "the total is still what it always was — this is not a fix"
+      (is (= 100500 (:invoice/total inv))
+          "¥100,000 + $500, and no arithmetic here disagrees with that"))
+    (testing "but it can no longer be read as a single-currency figure"
+      (is (false? (:invoice/total-is-one-currency? inv)))
+      (is (= ["JPY" "USD"] (:invoice/currencies inv))))
+    (testing "and `:invoice/currency` is the first CARD's, which need not be
+              either of them — that is why it cannot be the detector"
+      (is (= "JPY" (:invoice/currency inv))))))
+
+(deftest a-single-currency-total-says-that-too
+  (let [ok [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+            (psa/rate-card "p1" "designer" 8000 :currency "JPY" :tax-category :reduced)]
+        inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)
+                                   (ts* "designer" "2026-08-01" 5)] ok)]
+    (is (true? (:invoice/total-is-one-currency? inv)))
+    (is (= ["JPY"] (:invoice/currencies inv)))
+    (is (= 140000 (:invoice/total inv)))))
+
+(deftest an-invoice-with-nothing-billable-added-nothing-wrongly
+  (testing "true, not false: nothing was summed, so nothing was summed across
+            currencies. Deliberately NOT the reading
+            `bookkeeping.trial-balance/balanced?` takes of an empty set —
+            that function asserts the books balance and this one only says no
+            unlike things were added"
+    (let [inv (psa/invoice "i" "p1" [] [(psa/rate-card "p1" "dev" 10000 :currency "JPY")])]
+      (is (true? (:invoice/total-is-one-currency? inv)))
+      (is (= [] (:invoice/currencies inv)))
+      (is (= 0 (:invoice/total inv))))))
+
+(deftest the-currencies-are-the-ones-USED-not-the-ones-offered
+  (testing "a card the caller passed but this invoice never priced against
+            must not make the total look mixed — the same reason
+            `:invoice/subtotals` counts contributing cards and not all cards"
+    (let [cards [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "p1" "auditor" 200 :currency "USD" :tax-category :standard)]
+          inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)] cards)]
+      (is (true? (:invoice/total-is-one-currency? inv))
+          "no auditor hours were billed, so no dollars entered the total")
+      (is (= ["JPY"] (:invoice/currencies inv)))
+      (is (= {:standard 100000} (:invoice/subtotals-by-tax-category inv))))))

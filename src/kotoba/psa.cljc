@@ -357,7 +357,23 @@
   inherit its assumption: they are refused when the contributing cards
   disagree, and `:invoice/subtotals-currency` states the unit they are in
   when they do agree. It is nil when there were no lines, because nothing
-  declared one and an empty subtotal set needs no unit."
+  declared one and an empty subtotal set needs no unit.
+
+  **`:invoice/total` still has the assumption the subtotals refuse.** It sums
+  `:line/amount` across every line, so on a mixed-currency invoice it adds
+  ¥100,000 and $500 and reports 100500. That is not new — it predates the
+  subtotals — but it is now visible: `:invoice/currencies` lists what was
+  actually used, and `:invoice/total-is-one-currency?` is false. Both keys
+  are additive; `:invoice/total` and `:invoice/currency` are unchanged,
+  because consumers read them and silently redefining a key is worse than a
+  wrong number somebody can now detect. A caller needing a correct total on
+  a mixed invoice must sum `:invoice/lines` itself, per currency.
+
+  `:invoice/total-is-one-currency?` is **true** for an invoice with no
+  billable lines: nothing was added, so nothing was added wrongly. That is
+  deliberately NOT the reading `bookkeeping.trial-balance/balanced?` takes
+  of an empty set — that function asserts the books balance, and this one
+  only says no unlike things were summed."
   ([id project entries cards] (invoice id project entries cards #{}))
   ([id project entries cards billed]
    (let [mine (filter #(= project (:ts/project %)) entries)
@@ -380,8 +396,25 @@
       {:invoice/id       id
        :invoice/project  project
        :invoice/lines    lines
+       ;; ⚠ `:invoice/total` sums `:line/amount` across every line, and the
+       ;; lines of one invoice are NOT guaranteed to be in one currency (see
+       ;; the Currency section above). Measured 2026-08-18: an invoice drawing
+       ;; on a ¥10,000/h card and a $100/h card reports a total of 100500,
+       ;; which is ¥100,000 and $500 added together. It is wrong, it looks
+       ;; right, and nothing about the number says which — the same shape of
+       ;; defect this workspace already fixed at the journal-entry level
+       ;; (`bookkeeping.posting`) and in the trial balance (keyed
+       ;; `[account currency]`).
+       ;;
+       ;; It is left as it is because consumers read it, and changing its
+       ;; meaning is a breaking change that is not this function's to make.
+       ;; What IS added is the marker, so the number can no longer be read as
+       ;; a single-currency figure without checking.
        :invoice/total    (reduce + 0 (map :line/amount lines))
        :invoice/currency (or (:rate/currency (first cards)) "USD")
+       :invoice/currencies (vec (sort (distinct (keep :rate/currency cards-used))))
+       :invoice/total-is-one-currency?
+       (<= (count (distinct (keep :rate/currency cards-used))) 1)
        :invoice/entries  (mapv entry-key (map :priced/entry billable))
        :invoice/unpriced (mapv (comp entry-key :priced/entry) unpriced)
        :invoice/excluded-already-billed (mapv entry-key dupes)}
