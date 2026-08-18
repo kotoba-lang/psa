@@ -35,6 +35,25 @@ library exists to draw.
   inputs are absent. Progress caps at 1.0 — the overrun belongs in margin.
 - Keep this repo dependency-free; it composes with its siblings by shape only.
 
+## Tax categories are a grouping, not a rate
+
+`rate-card`'s `:tax-category` is an **opaque keyword**. Do not put a rate, a
+percentage, or a jurisdiction in this library — it prices US, EU and Japanese
+engagements out of the same function, and a rate is a jurisdiction's fact with a
+date on it. What belongs here is which category a line falls in, because that is
+a fact about the engagement and it is the one thing the taxing rule cannot infer.
+
+`:invoice/subtotals-by-tax-category` is `:unknown`, never a partial map. A
+partial map does not read as partial — it reads as a smaller invoice, and a tax
+library handed one rounds the shortfall into a legal figure. If you find yourself
+making it return the categories it *does* know, you are removing the refusal.
+
+There is no project-level default category. `rate-for`'s role-less fallback card
+already lets a project declare one once; it does not survive being overridden,
+and that is the point.
+
 ## Test
 
     clojure -M:test && clojure -M:lint
+    nbb --classpath src:test test/run_portable.cljs
+    nbb tools/check-mutations.cljs && nbb tools/mutate.cljs

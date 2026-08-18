@@ -22,7 +22,7 @@ any of them depending on the others.
 |---|---|
 | Role | capability |
 | Dependencies | none |
-| Tests | 41 tests, 96 assertions, all green |
+| Tests | 58 tests, 146 assertions, all green |
 | Runtime | `.cljc`, JVM + ClojureScript |
 | Actor | `cloud-itonami/tehai` (手配) |
 
@@ -105,6 +105,83 @@ absent capacity is *unknown*, absent price is a *refusal to guess*.
 Lines are grouped by role, so a project billed at two rates shows two lines
 rather than one blended figure nobody can check.
 
+## Tax categories — the grouping, never the rate
+
+A taxing rule does not want lines. 消費税法施行令 第七十条の十 computes the tax
+on 「税率の異なるごとに区分して合計した金額」 — the **per-rate subtotal**,
+multiplied once and rounded once. Taxing each line and summing the results is a
+third method the article does not offer. So the caller must hand its tax library
+per-category subtotals, and this is where the lines are.
+
+What this library supplies is the **grouping** and never the rate. It does not
+know that `:standard` means 10% anywhere — the category is an opaque keyword it
+carries from the rate card to the invoice. A 10% constant in a
+jurisdiction-neutral library would be wrong for two of the three continents it
+bills on, and wrong for the third the day a rate changes.
+
+```clojure
+(psa/rate-card "kappa" :engineer 15000 :cost 9000 :currency "JPY"
+               :tax-category :standard)
+
+(psa/invoice "inv-1" "kappa" entries cards)
+;; => {:invoice/total 178000
+;;     :invoice/lines [{:line/role :caterer :line/tax-category :reduced ...} ...]
+;;     :invoice/subtotals-by-tax-category {:standard 168000 :reduced 10000}
+;;     :invoice/subtotals-complete? true
+;;     :invoice/subtotals-gaps     #{}
+;;     :invoice/uncategorised      []
+;;     :invoice/subtotals-currency "JPY"
+;;     ...}
+```
+
+`:invoice/subtotals-by-tax-category` is exactly the shape
+`kotoba.taxlaw/consumption-tax-amount` takes as its `:subtotals`.
+
+There is **no project-level default category**, and the argument is in
+`rate-card`'s docstring. A role-less card is already the project-wide fallback
+for the rate *and* the category together, so a project may declare it once — it
+simply does not survive being overridden by an exact-role card. The card that
+priced the line is the card that categorises it, so there is one place to look.
+
+**The refusal.** If any contributing rate card declares no category, the
+subtotals are not merely incomplete, they are *wrong*: they would sum to less
+than `:invoice/total` while looking like a finished map, and a tax library handed
+them would round the shortfall into a legal figure. So there is nothing shaped
+like an answer to misread —
+
+```clojure
+(psa/invoice "inv-1" "kappa" entries cards-with-one-uncategorised)
+;; => {:invoice/total 238000                              ; unchanged — the line
+;;                                                        ; is billable, just not
+;;                                                        ; taxable
+;;     :invoice/subtotals-by-tax-category :unknown        ; not a partial map
+;;     :invoice/subtotals-complete? false
+;;     :invoice/subtotals-gaps     #{:uncategorised-cards}
+;;     :invoice/uncategorised      [["kappa" :architect]] ; card-keys, named the
+;;     ...}                                               ; way :invoice/unpriced
+;;                                                        ; names entries
+
+(psa/describe-tax-gap inv)
+;; => "1 rate cards declared no tax category, so no per-category subtotals were stated"
+```
+
+None of those requires comparing counts to interpret, and `describe-tax-gap`
+returns `""` when there is nothing to say — the same discipline as
+`describe-gap`, which is left alone because an uncategorised line *was* billed
+and belongs to a different question.
+
+`{}` with `:invoice/subtotals-complete? true` is a real answer: an invoice with
+no billable lines owes no tax, and `{}` sums to its total, zero. The subtotals
+partition the **lines**, so entries that never became lines are
+`:invoice/unpriced`'s business and do not make the subtotals incomplete.
+
+**Currency is checked, not assumed.** One invoice is *not* one currency by
+construction: `:invoice/currency` is the first card the caller passed, which need
+not be a card the invoice used, and nothing requires a project's cards to agree.
+That key is left exactly as it was. The subtotals do not inherit its assumption —
+they are refused with `#{:mixed-currency}` when the contributing cards disagree,
+and `:invoice/subtotals-currency` states the unit when they do not.
+
 `entry-key` is content-derived — `[worker date project role]` — rather than a
 generated id, so the same day's work read from two systems collides on purpose
 and a re-imported timesheet cannot be billed twice.
@@ -181,8 +258,18 @@ it used is a total nobody can check.
 ## Test
 
 ```bash
-clojure -M:test
+clojure -M:test                                # JVM
+nbb --classpath src:test test/run_portable.cljs  # the same suite on Node
 clojure -M:lint
+```
+
+**Mutation testing.** `tools/mutations.edn` covers *only* the tax-category
+feature — the rest of the library is not mutated, so a clean run says nothing
+about the four invariants above.
+
+```bash
+nbb tools/check-mutations.cljs   # every :find occurs exactly once
+nbb tools/mutate.cljs            # 20 mutations; a SURVIVOR is a test gap
 ```
 
 ## License

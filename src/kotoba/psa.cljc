@@ -45,13 +45,61 @@
 (defn rate-card
   "Construct a rate card entry: what an hour of `role` on `project` is
   billed at, and what it costs. `cost` may be omitted — margin then
-  reports :unknown rather than pretending the work was free."
-  [project role billable & {:keys [cost currency]}]
-  {:rate/project  project
-   :rate/role     role
-   :rate/billable billable
-   :rate/cost     cost
-   :rate/currency (or currency "USD")})
+  reports :unknown rather than pretending the work was free.
+
+  `:tax-category` is which tax-RATE category an hour of this work falls
+  in. It is an OPAQUE keyword here: this library does not know that
+  `:standard` means 10% anywhere, and it must not, because it prices US,
+  EU and Japanese engagements out of the same function and a rate is a
+  jurisdiction's fact with a date on it. What belongs here is the
+  grouping — which category a line falls in — because that is a fact
+  about the engagement, it is the one thing the taxing rule cannot infer,
+  and this is where the lines are. See `invoice`.
+
+  Omitted, it is nil, and every invoice drawing on this card refuses to
+  state per-category subtotals at all rather than state some of them.
+
+  ## Should there be a project-level default?
+
+  Argued both ways, because the answer is not obvious.
+
+  FOR: taxability is usually a property of the supply, not of the role.
+  A firm whose whole engagement is standard-rated would otherwise repeat
+  `:tax-category :standard` on every card, and a repeated declaration is
+  a declaration that will eventually be forgotten on one card — which is
+  precisely the state this refuses to bill through.
+
+  AGAINST, and this is the choice made: a default is what invariant 1
+  already refuses for rates. A project-level category that leaked PAST an
+  exact-role card would put the rate and the category on two different
+  cards, so a reader asking `why is this line standard-rated` would have
+  to know which of two cards won for which field. Worse, the case a
+  default gets wrong is exactly the case that matters — the one role on
+  the engagement that is rated differently, which is the reason a
+  category exists at all.
+
+  So there is no separate project-level mechanism, and none is needed:
+  `rate-for` already has one. A role-less card is the project-wide
+  fallback for the rate AND for the category together, so a project may
+  declare its category once. It simply does not survive being overridden
+  by an exact-role card — the card that priced the line is the card that
+  categorises it, and there is exactly one place to look."
+  [project role billable & {:keys [cost currency tax-category]}]
+  {:rate/project      project
+   :rate/role         role
+   :rate/billable     billable
+   :rate/cost         cost
+   :rate/currency     (or currency "USD")
+   :rate/tax-category tax-category})
+
+(defn card-key
+  "Identity of a rate card: `[project role]`. Content-derived like
+  `entry-key`, so a card named in `:invoice/uncategorised` can be found
+  again in the caller's card list without a generated id. A project-wide
+  fallback card's role is nil and its key says nil, rather than naming a
+  role the card never claimed."
+  [c]
+  [(:rate/project c) (:rate/role c)])
 
 (defn rate-for
   "Look up the rate card for [project role]. A role-less card
@@ -207,6 +255,45 @@
   [e]
   [(:ts/worker e) (:ts/date e) (:ts/project e) (:ts/role e)])
 
+(defn- tax-subtotals
+  "Per-tax-category subtotals over `lines`, or a refusal.
+
+  `cards-used` are the rate cards that actually priced a billable line —
+  not the caller's whole card list, which may hold cards for other
+  projects that contribute nothing here.
+
+  Two things stop a subtotal map from being produced, and in both cases
+  what comes back is `:unknown` rather than a map with some of the
+  categories in it. A partial map does not read as partial: it reads as
+  a smaller invoice, and it understates the tax by exactly the lines it
+  omitted.
+
+    :uncategorised-cards  some contributing card declared no category
+    :mixed-currency       the contributing cards do not agree on one,
+                          so the subtotals would add two units together"
+  [lines cards-used]
+  (let [uncategorised (->> cards-used
+                           (filter #(nil? (:rate/tax-category %)))
+                           (map card-key)
+                           (sort-by str)
+                           vec)
+        currencies (vec (distinct (map :rate/currency cards-used)))
+        mixed? (> (count currencies) 1)
+        gaps (cond-> #{}
+               (seq uncategorised) (conj :uncategorised-cards)
+               mixed?              (conj :mixed-currency))
+        complete? (empty? gaps)]
+    {:invoice/subtotals-by-tax-category
+     (if complete?
+       (reduce (fn [acc l]
+                 (update acc (:line/tax-category l) (fnil + 0) (:line/amount l)))
+               {} lines)
+       :unknown)
+     :invoice/subtotals-complete? complete?
+     :invoice/subtotals-gaps      gaps
+     :invoice/uncategorised       uncategorised
+     :invoice/subtotals-currency  (if mixed? :unknown (first currencies))}))
+
 (defn invoice
   "Draft an invoice for `project` from `:ts/*` entries.
 
@@ -217,30 +304,88 @@
   not.
 
   Lines are grouped by role, so a project billed at two rates shows two
-  lines rather than one blended figure nobody can check."
+  lines rather than one blended figure nobody can check.
+
+  ## Per-tax-category subtotals
+
+  A taxing rule does not want lines. 消費税法施行令 第七十条の十 computes
+  the tax on 「税率の異なるごとに区分して合計した金額」 — the per-rate
+  subtotal — multiplied once and rounded once. Taxing each line and
+  summing the results is a third method the article does not offer, and
+  it differs by up to ¥1 per rate on every invoice. So the caller must
+  hand its tax library per-category subtotals, and this is where the
+  lines are.
+
+  What this library supplies is the GROUPING and never the rate. It does
+  not know that `:standard` means 10% anywhere; the category is an opaque
+  keyword it carries from `rate-card` to here. A 10% constant in a
+  jurisdiction-neutral library would be wrong for two of the three
+  continents it bills on, and wrong for the third the day a rate changes.
+
+      :invoice/subtotals-by-tax-category  {category amount}, or :unknown
+      :invoice/subtotals-complete?        boolean
+      :invoice/subtotals-gaps             set of reasons, #{} when none
+      :invoice/uncategorised              [[project role] ...] card-keys
+      :invoice/subtotals-currency         the one currency, or :unknown
+      :line/tax-category                  on each line, for 区分記載
+
+  `{}` with `:invoice/subtotals-complete? true` is a real answer: an
+  invoice with no billable lines owes no tax, and the subtotals sum to
+  its total, which is zero. The subtotals partition the LINES, not the
+  entries — what never became a line is `:invoice/unpriced`'s business
+  and does not make the subtotals incomplete.
+
+  ## The refusal
+
+  If any contributing card declares no category, the subtotals are not
+  merely missing an entry, they are WRONG: they sum to less than
+  `:invoice/total` while looking like a complete map, and a tax library
+  handed them would round the shortfall into a legal figure. So there is
+  no partial map to misread — `:invoice/subtotals-by-tax-category` is the
+  keyword `:unknown`, `:invoice/subtotals-complete?` is false, and
+  `:invoice/uncategorised` names the cards, the way `:invoice/unpriced`
+  names the entries that could not be priced. None of those three
+  requires counting lines to interpret.
+
+  ## Currency
+
+  Checked, not assumed: one invoice is NOT one currency by construction.
+  `:invoice/currency` is `(:rate/currency (first cards))` — the first card
+  the CALLER passed, which need not be a card this invoice used, and
+  nothing anywhere requires the cards of one project to agree. That key is
+  left exactly as it was, because consumers read it. The subtotals do not
+  inherit its assumption: they are refused when the contributing cards
+  disagree, and `:invoice/subtotals-currency` states the unit they are in
+  when they do agree. It is nil when there were no lines, because nothing
+  declared one and an empty subtotal set needs no unit."
   ([id project entries cards] (invoice id project entries cards #{}))
   ([id project entries cards billed]
    (let [mine (filter #(= project (:ts/project %)) entries)
          {dupes true fresh false} (group-by #(contains? billed (entry-key %)) mine)
          priced (map #(price-entry cards %) fresh)
          {unpriced true billable false} (group-by :priced/unpriced? priced)
+         cards-used (vec (distinct (map :priced/rate billable)))
          lines (->> billable
                     (group-by #(get-in % [:priced/rate :rate/role]))
                     (map (fn [[role items]]
                            {:line/role   role
                             :line/hours  (reduce + 0.0 (map (comp :ts/hours :priced/entry) items))
                             :line/rate   (get-in (first items) [:priced/rate :rate/billable])
-                            :line/amount (reduce + 0 (map :priced/billable items))}))
+                            :line/amount (reduce + 0 (map :priced/billable items))
+                            :line/tax-category (get-in (first items)
+                                                       [:priced/rate :rate/tax-category])}))
                     (sort-by #(str (:line/role %)))
                     vec)]
-     {:invoice/id       id
-      :invoice/project  project
-      :invoice/lines    lines
-      :invoice/total    (reduce + 0 (map :line/amount lines))
-      :invoice/currency (or (:rate/currency (first cards)) "USD")
-      :invoice/entries  (mapv entry-key (map :priced/entry billable))
-      :invoice/unpriced (mapv (comp entry-key :priced/entry) unpriced)
-      :invoice/excluded-already-billed (mapv entry-key dupes)})))
+     (merge
+      {:invoice/id       id
+       :invoice/project  project
+       :invoice/lines    lines
+       :invoice/total    (reduce + 0 (map :line/amount lines))
+       :invoice/currency (or (:rate/currency (first cards)) "USD")
+       :invoice/entries  (mapv entry-key (map :priced/entry billable))
+       :invoice/unpriced (mapv (comp entry-key :priced/entry) unpriced)
+       :invoice/excluded-already-billed (mapv entry-key dupes)}
+      (tax-subtotals lines cards-used)))))
 
 (defn billable?
   "Would `entry` produce a line on an invoice? Useful as a pre-check so a
@@ -260,6 +405,30 @@
               (cond-> []
                 (pos? u) (conj (str u " entries had no rate card and were not billed"))
                 (pos? d) (conj (str d " entries were already billed and were excluded"))))))
+
+(defn describe-tax-gap
+  "One-line human summary of why an invoice's per-category subtotals are
+  `:unknown`. Empty string when they are complete — the same discipline as
+  `describe-gap`: absence of text is the signal, and there is no
+  reassuring `all categorised` line that would print just as happily when
+  nothing was checked.
+
+  Deliberately NOT folded into `describe-gap`. That function reports what
+  could not be BILLED; an uncategorised line is billed, is on the invoice,
+  and is in the total. What it cannot be is taxed. One sentence answering
+  both questions would make each of them harder to read, and would change
+  the meaning of a string consumers already print."
+  [inv]
+  (let [gaps (:invoice/subtotals-gaps inv)
+        u (count (:invoice/uncategorised inv))]
+    (str/join "; "
+              (cond-> []
+                (contains? gaps :uncategorised-cards)
+                (conj (str u " rate cards declared no tax category, so no"
+                           " per-category subtotals were stated"))
+                (contains? gaps :mixed-currency)
+                (conj (str "the rate cards used declare more than one currency,"
+                           " so per-category subtotals would add two units"))))))
 
 (defn hours->ms [h] (* h ms-per-hour))
 (defn ms->hours [ms] (/ (double ms) ms-per-hour))
