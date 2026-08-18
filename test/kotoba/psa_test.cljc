@@ -367,3 +367,197 @@
 
 (deftest an-unknown-recognition-method-does-not-construct
   (is (nil? (psa/contract "alpha" :vibes-based))))
+
+;; ---------------------------------------------------------------------------
+;; Tax categories — the grouping, never the rate
+;;
+;; What the taxing rule needs and cannot infer is which rate CATEGORY a line
+;; falls in. 消費税法施行令 第七十条の十 taxes 「税率の異なるごとに区分して
+;; 合計した金額」 — the per-category subtotal, multiplied once and rounded
+;; once — so a caller must hand it subtotals, and this is where the lines are.
+;; The rate itself is a jurisdiction's fact with a date on it and stays out.
+;; ---------------------------------------------------------------------------
+
+(def ^:private jp-cards
+  [(psa/rate-card "kappa" :engineer 15000 :cost 9000 :currency "JPY" :tax-category :standard)
+   (psa/rate-card "kappa" :designer 12000 :cost 8000 :currency "JPY" :tax-category :standard)
+   (psa/rate-card "kappa" :caterer   5000 :cost 3000 :currency "JPY" :tax-category :reduced)])
+
+(defn- kappa-entries []
+  [(ts "w-1" "2026-01-01" "kappa" :engineer 8)     ;; 120000 standard
+   (ts "w-2" "2026-01-01" "kappa" :designer 4)     ;;  48000 standard
+   (ts "w-3" "2026-01-01" "kappa" :caterer 2)])    ;;  10000 reduced
+
+(deftest a-rate-card-carries-an-opaque-tax-category
+  (is (= :standard (:rate/tax-category (first jp-cards))))
+  (testing "opaque here — this library does not know what any of them mean"
+    (is (= :vat-zero-rated
+           (:rate/tax-category (psa/rate-card "x" :r 1 :tax-category :vat-zero-rated)))))
+  (testing "omitted is nil, and nil is not a default category"
+    (is (nil? (:rate/tax-category (psa/rate-card "x" :r 1))))))
+
+(deftest card-key-identifies-a-card-by-project-and-role
+  (is (= ["kappa" :engineer] (psa/card-key (first jp-cards))))
+  (testing "two roles on one project are two different cards"
+    (is (not= (psa/card-key (nth jp-cards 0)) (psa/card-key (nth jp-cards 1)))))
+  (testing "a project-wide fallback card says nil rather than naming a role"
+    (is (= ["lambda" nil] (psa/card-key (psa/rate-card "lambda" nil 10000))))))
+
+(deftest a-line-carries-its-tax-category
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (testing "so a 適格請求書 can print 区分記載 per line without re-deriving it"
+      (is (= [:reduced :standard :standard]
+             (mapv :line/tax-category (:invoice/lines inv)))))))
+
+(deftest subtotals-add-the-lines-in-each-category
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (testing "two roles in one category are added, not one of them chosen"
+      (is (= {:standard 168000 :reduced 10000}
+             (:invoice/subtotals-by-tax-category inv))))
+    (is (:invoice/subtotals-complete? inv))
+    (is (= #{} (:invoice/subtotals-gaps inv)))
+    (is (= [] (:invoice/uncategorised inv)))
+    (testing "and they state the unit they are in"
+      (is (= "JPY" (:invoice/subtotals-currency inv))))))
+
+(deftest the-subtotals-account-for-the-whole-invoice-total
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (is (= 178000 (:invoice/total inv)))
+    (testing "a complete subtotal map sums to the total it partitions"
+      (is (= (:invoice/total inv)
+             (reduce + 0 (vals (:invoice/subtotals-by-tax-category inv))))))))
+
+(deftest one-uncategorised-card-refuses-the-whole-subtotal-map
+  (let [cards (conj jp-cards (psa/rate-card "kappa" :architect 20000 :currency "JPY"))
+        entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+        inv (psa/invoice "inv-1" "kappa" entries cards)]
+    (testing "not a partial map — there is nothing shaped like an answer to misread"
+      (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+      (is (not (map? (:invoice/subtotals-by-tax-category inv)))))
+    (testing "and the caller can tell which case it is without counting lines"
+      (is (false? (:invoice/subtotals-complete? inv)))
+      (is (= #{:uncategorised-cards} (:invoice/subtotals-gaps inv))))
+    (testing "the card is named, the way :invoice/unpriced names an entry"
+      (is (= [["kappa" :architect]] (:invoice/uncategorised inv))))
+    (testing "the line is still billed — it is untaxable, not unbillable"
+      (is (= 238000 (:invoice/total inv)))
+      (is (= 4 (count (:invoice/lines inv))))
+      (is (= "" (psa/describe-gap inv))))))
+
+(deftest a-partial-subtotal-map-would-have-understated-the-tax
+  (let [cards (conj jp-cards (psa/rate-card "kappa" :architect 20000 :currency "JPY"))
+        entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+        inv (psa/invoice "inv-1" "kappa" entries cards)
+        categorised (reduce + 0 (map :line/amount
+                                     (filter :line/tax-category (:invoice/lines inv))))]
+    (testing "the categorised part is 60000 short of the total, so a map of it
+              would have been taxed as a smaller invoice"
+      (is (= 178000 categorised))
+      (is (< categorised (:invoice/total inv))))
+    (is (= :unknown (:invoice/subtotals-by-tax-category inv)))))
+
+(deftest contributing-cards-that-disagree-on-a-currency-refuse
+  (testing "one invoice is not one currency by construction; nothing enforces it"
+    (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "mu" :designer 120 :currency "USD" :tax-category :standard)]
+          entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                   (ts "w-2" "2026-01-01" "mu" :designer 8)]
+          inv (psa/invoice "inv-1" "mu" entries cards)]
+      (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+      (is (= #{:mixed-currency} (:invoice/subtotals-gaps inv)))
+      (is (= :unknown (:invoice/subtotals-currency inv)))
+      (testing "nothing was uncategorised — the two refusals are distinguishable"
+        (is (= [] (:invoice/uncategorised inv)))))))
+
+(deftest both-refusals-are-reported-at-once
+  (testing "fixing one should not be how you discover the other"
+    (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "mu" :designer 120 :currency "USD")]
+          entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                   (ts "w-2" "2026-01-01" "mu" :designer 8)]
+          inv (psa/invoice "inv-1" "mu" entries cards)]
+      (is (= #{:uncategorised-cards :mixed-currency} (:invoice/subtotals-gaps inv)))
+      (is (= [["mu" :designer]] (:invoice/uncategorised inv))))))
+
+(deftest unpriced-entries-do-not-make-the-subtotals-incomplete
+  (testing "the subtotals partition the LINES; what never became a line is
+            :invoice/unpriced's business"
+    (let [entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+          inv (psa/invoice "inv-1" "kappa" entries jp-cards)]
+      (is (= 1 (count (:invoice/unpriced inv))))
+      (is (:invoice/subtotals-complete? inv))
+      (is (= {:standard 168000 :reduced 10000}
+             (:invoice/subtotals-by-tax-category inv))))))
+
+(deftest already-billed-entries-do-not-make-the-subtotals-incomplete
+  (let [first-inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)
+        billed (set (:invoice/entries first-inv))
+        second-inv (psa/invoice "inv-2" "kappa" (kappa-entries) jp-cards billed)]
+    (is (= 3 (count (:invoice/excluded-already-billed second-inv))))
+    (is (:invoice/subtotals-complete? second-inv))
+    (is (= {} (:invoice/subtotals-by-tax-category second-inv)))))
+
+(deftest an-invoice-with-no-lines-owes-no-tax-and-says-so
+  (testing "{} is a real answer, not a refusal: it sums to the total, zero"
+    (let [inv (psa/invoice "inv-1" "kappa" [] jp-cards)]
+      (is (= {} (:invoice/subtotals-by-tax-category inv)))
+      (is (:invoice/subtotals-complete? inv))
+      (is (zero? (:invoice/total inv)))
+      (testing "and no card declared a unit, so none is claimed"
+        (is (nil? (:invoice/subtotals-currency inv)))))))
+
+(deftest a-project-wide-card-categorises-a-role-it-never-named
+  (let [cards [(psa/rate-card "lambda" nil 10000 :currency "JPY" :tax-category :standard)]
+        inv (psa/invoice "inv-1" "lambda" [(ts "w-1" "2026-01-01" "lambda" :engineer 8)] cards)]
+    (is (= {:standard 80000} (:invoice/subtotals-by-tax-category inv)))
+    (is (= [:standard] (mapv :line/tax-category (:invoice/lines inv))))))
+
+(deftest an-exact-role-card-does-not-inherit-the-project-wide-category
+  (testing "the card that priced the line is the card that categorises it —
+            there is no project-level default that leaks past an override"
+    (let [cards [(psa/rate-card "lambda" nil 10000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "lambda" :engineer 15000 :currency "JPY")]
+          inv (psa/invoice "inv-1" "lambda" [(ts "w-1" "2026-01-01" "lambda" :engineer 8)] cards)]
+      (is (= 120000 (:invoice/total inv)))          ;; the role card won the rate
+      (testing "so it wins the category too, and it declared none"
+        (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+        (is (= [["lambda" :engineer]] (:invoice/uncategorised inv)))))))
+
+(deftest describe-tax-gap-is-empty-when-every-line-is-categorised
+  (testing "no reassuring 'all categorised' line — absence of text is the signal"
+    (is (= "" (psa/describe-tax-gap (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards))))))
+
+(deftest describe-tax-gap-names-each-way-it-can-refuse
+  (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+               (psa/rate-card "mu" :designer 120 :currency "USD")]
+        entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                 (ts "w-2" "2026-01-01" "mu" :designer 8)]
+        both (psa/describe-tax-gap (psa/invoice "inv-1" "mu" entries cards))]
+    (is (= (str "1 rate cards declared no tax category, so no per-category"
+                " subtotals were stated"
+                "; the rate cards used declare more than one currency, so"
+                " per-category subtotals would add two units")
+           both))))
+
+(deftest every-uncategorised-card-is-named-once-and-in-a-stable-order
+  (testing "a consumer diffing two drafts should not see a reordering that
+            is not a change, and a card that priced two entries is one card"
+    ;; The entries arrive designer, engineer, auditor, so neither the order
+    ;; they were declared in NOR its reverse is the sorted order — an
+    ;; assertion that held for either of those would not be measuring a sort.
+    (let [cards [(psa/rate-card "nu" :engineer 15000 :currency "JPY")
+                 (psa/rate-card "nu" :designer 12000 :currency "JPY")
+                 (psa/rate-card "nu" :auditor 18000 :currency "JPY")
+                 (psa/rate-card "nu" :caterer 5000 :currency "JPY" :tax-category :reduced)]
+          entries [(ts "w-1" "2026-01-01" "nu" :designer 4)
+                   (ts "w-2" "2026-01-01" "nu" :engineer 8)
+                   (ts "w-2" "2026-01-02" "nu" :engineer 8)   ;; same card, second entry
+                   (ts "w-3" "2026-01-01" "nu" :auditor 1)
+                   (ts "w-4" "2026-01-01" "nu" :caterer 2)]
+          inv (psa/invoice "inv-1" "nu" entries cards)]
+      (is (= [["nu" :auditor] ["nu" :designer] ["nu" :engineer]]
+             (:invoice/uncategorised inv)))
+      (testing "and the summary counts cards, not entries and not one"
+        (is (= (str "3 rate cards declared no tax category, so no per-category"
+                    " subtotals were stated")
+               (psa/describe-tax-gap inv)))))))
