@@ -1,5 +1,5 @@
 (ns check-mutations
-  "Pre-flight for `tools/mutate.cljs`: every `:find` must occur EXACTLY once
+  "Pre-flight for `tools/mutate.cljk`: every `:find` must occur EXACTLY once
   in its file. The harness throws on a violation, which aborts the whole run
   after it has already spent minutes on the mutations before it — so the
   cheap check runs first.
