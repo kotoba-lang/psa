@@ -259,7 +259,7 @@ it used is a total nobody can check.
 
 ```bash
 clojure -M:test                                # JVM
-nbb --classpath src:test test/run_portable.cljs  # the same suite on Node
+nbb --classpath src:test test/run_portable.cljk  # the same suite on Node
 clojure -M:lint
 ```
 
@@ -268,8 +268,8 @@ feature — the rest of the library is not mutated, so a clean run says nothing
 about the four invariants above.
 
 ```bash
-nbb tools/check-mutations.cljs   # every :find occurs exactly once
-nbb tools/mutate.cljs            # 20 mutations; a SURVIVOR is a test gap
+nbb tools/check-mutations.cljk   # every :find occurs exactly once
+nbb tools/mutate.cljk            # 20 mutations; a SURVIVOR is a test gap
 ```
 
 ## License
