@@ -258,9 +258,9 @@ it used is a total nobody can check.
 ## Test
 
 ```bash
-clojure -M:test                                # JVM
-nbb --classpath src:test test/run_portable.cljk  # the same suite on Node
-clojure -M:lint
+kbb -M:test                                # JVM
+kbb --backend sci --classpath src:test test/run_portable.cljk  # the same suite on Node
+kbb -M:lint
 ```
 
 **Mutation testing.** `tools/mutations.edn` covers *only* the tax-category
@@ -268,8 +268,8 @@ feature — the rest of the library is not mutated, so a clean run says nothing
 about the four invariants above.
 
 ```bash
-nbb tools/check-mutations.cljk   # every :find occurs exactly once
-nbb tools/mutate.cljk            # 20 mutations; a SURVIVOR is a test gap
+kbb --backend sci tools/check-mutations.cljk   # every :find occurs exactly once
+kbb --backend sci tools/mutate.cljk            # 20 mutations; a SURVIVOR is a test gap
 ```
 
 ## License
