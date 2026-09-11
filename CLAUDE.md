@@ -54,6 +54,6 @@ and that is the point.
 
 ## Test
 
-    clojure -M:test && clojure -M:lint
-    nbb --classpath src:test test/run_portable.cljk
-    nbb tools/check-mutations.cljk && nbb tools/mutate.cljk
+    kbb -M:test && kbb -M:lint
+    kbb --backend sci --classpath src:test test/run_portable.cljk
+    kbb --backend sci tools/check-mutations.cljk && kbb --backend sci tools/mutate.cljk
