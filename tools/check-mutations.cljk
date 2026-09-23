@@ -6,7 +6,7 @@
 
   Reports SCANNED so an empty table cannot report clean."
   (:require ["node:fs" :as fs]
-            [clojure.edn :as edn]))
+            [kotoba.lang.edn :as edn]))
 
 (defn -main [& _]
   (let [table (edn/read-string (.readFileSync fs "tools/mutations.edn" "utf8"))
