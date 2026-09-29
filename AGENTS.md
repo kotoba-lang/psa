@@ -1,4 +1,4 @@
-# CLAUDE.md — kotoba-lang/psa
+# AGENTS.md — kotoba-lang/psa
 
 Professional services: staffing, rates, margin, utilization, invoices, expenses,
 subcontractors, revenue recognition, currency. Zero dependencies.
